@@ -1,4 +1,5 @@
 import { getMic } from './audio'
+import { startLevelMeter } from './levelMeter'
 
 /**
  * Clap to wake him up.
@@ -24,7 +25,7 @@ const MIN_PEAK = 0.055
 
 /** The room has to have been this quiet just before the strike. */
 const QUIET_BEFORE = 0.16
-/** Frames of history kept — about a third of a second at 60fps. */
+/** Readings of history kept — about a third of a second at the meter's 60Hz. */
 const HISTORY = 20
 /** How many frames back "just before" means. */
 const LOOKBACK = 5
@@ -72,36 +73,20 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
   const ctx = new AudioContext()
   void ctx.resume()
   const source = ctx.createMediaStreamSource(stream)
-  const analyser = ctx.createAnalyser()
-  // Small window: we are looking for an attack, and a long FFT smears exactly
-  // the sharpness that identifies one.
-  analyser.fftSize = 512
-  analyser.smoothingTimeConstant = 0
-  source.connect(analyser)
-  const buf = new Float32Array(analyser.fftSize)
 
   const history: number[] = []
   let floor = 0.01
   let stopped = false
-  let raf = 0
   let lastClap = 0
 
   /** A transient under examination, waiting to prove it decays. */
   let candidate: { at: number; peak: number } | null = null
 
-  const rms = () => {
-    analyser.getFloatTimeDomainData(buf)
-    let sum = 0
-    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i]
-    return Math.sqrt(sum / buf.length)
-  }
-
-  const tick = () => {
+  // Driven by the audio thread, not requestAnimationFrame, so a clap still
+  // registers while the tab is hidden. `now` is the meter's clock.
+  const tick = (level: number, now: number) => {
     if (stopped) return
-    raf = requestAnimationFrame(tick)
 
-    const now = performance.now()
-    const level = rms()
     history.push(level)
     if (history.length > HISTORY) history.shift()
 
@@ -145,14 +130,16 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
     candidate = { at: now, peak: level }
   }
 
-  tick()
+  // Small window: we are looking for an attack, and a long one smears exactly
+  // the sharpness that identifies it.
+  const meter = await startLevelMeter(ctx, source, 512, tick)
   diag.listening = true
 
   return {
     stop: () => {
       stopped = true
       diag.listening = false
-      cancelAnimationFrame(raf)
+      meter.stop()
       try {
         source.disconnect()
         // The shared microphone stream is NOT stopped here. It belongs to
