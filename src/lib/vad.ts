@@ -1,4 +1,5 @@
 import { getMic } from './audio'
+import { startLevelMeter } from './levelMeter'
 
 /**
  * Voice-activity detection and segment capture.
@@ -123,11 +124,6 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   // is a no-op when it is already running.
   void ctx.resume()
   const source = ctx.createMediaStreamSource(stream)
-  const analyser = ctx.createAnalyser()
-  analyser.fftSize = 1024
-  analyser.smoothingTimeConstant = 0.35
-  source.connect(analyser)
-  const buf = new Float32Array(analyser.fftSize)
 
   let stopped = false
   let guard = false
@@ -142,14 +138,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   let speaking = false
   let speechStartedAt = 0
   let lastLoud = 0
-  let raf = 0
-
-  const rms = (): number => {
-    analyser.getFloatTimeDomainData(buf)
-    let sum = 0
-    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i]
-    return Math.sqrt(sum / buf.length)
-  }
+  /** Time of the latest reading, on the meter's clock (see levelMeter.ts). */
+  let lastNow = 0
 
   const startRecorder = () => {
     parts = []
@@ -178,7 +168,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
   const endSegment = () => {
     const rec = recorder
-    const startedAt = speechStartedAt
+    // Measured on the same clock the timestamps came from.
+    const ms = speechStartedAt ? lastNow - speechStartedAt : 0
     speaking = false
     speechStartedAt = 0
     if (!rec) return
@@ -188,7 +179,6 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
       const type = rec.mimeType || mime || 'audio/webm'
       const blob = new Blob(parts, { type })
       parts = []
-      const ms = startedAt ? performance.now() - startedAt : 0
       h.onEnd(blob, ms)
     }
     rec.onstop = finalise
@@ -200,11 +190,12 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
     }
   }
 
-  const tick = () => {
+  // Driven by the audio thread, not requestAnimationFrame, so detection keeps
+  // running while the tab is hidden. See levelMeter.ts.
+  const tick = (energy: number, now: number) => {
     if (stopped) return
-    raf = requestAnimationFrame(tick)
+    lastNow = now
 
-    const energy = rms()
     smoothEnergy += (energy - smoothEnergy) * 0.5
     h.onLevel(Math.min(1, smoothEnergy * 12))
 
@@ -217,7 +208,6 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
     threshold = floor * TRIGGER_OVER_FLOOR * (guard ? GUARD_BOOST : 1)
     const release = threshold * RELEASE_RATIO
-    const now = performance.now()
 
     if (!speaking) {
       if (smoothEnergy > threshold) {
@@ -250,12 +240,12 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
     }
   }
 
-  tick()
+  const meter = await startLevelMeter(ctx, source, 1024, tick)
 
   return {
     stop: () => {
       stopped = true
-      cancelAnimationFrame(raf)
+      meter.stop()
       discardRecorder()
       try {
         source.disconnect()
